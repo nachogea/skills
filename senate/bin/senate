@@ -1,0 +1,419 @@
+#!/usr/bin/env bash
+# Rex layout and forum plumbing for the senate skill. Run `senate help`.
+set -euo pipefail
+
+self=$0
+while [ -L "$self" ]; do
+  target=$(readlink "$self")
+  case $target in /*) self=$target ;; *) self=$(dirname "$self")/$target ;; esac
+done
+SKILL_DIR=$(cd "$(dirname "$self")/.." && pwd)
+ROSTER=${SENATE_ROSTER:-$SKILL_DIR/roster.json}
+SENATE_HOME=${SENATE_HOME:-$HOME/.senate}
+
+die() { echo "senate: $*" >&2; exit 1; }
+
+usage() {
+  cat <<EOF
+senate init SLUG [REPO]          create a forum, print its path
+senate latest                    print the most recent forum
+senate roster                    list senators and legionaries
+senate convene FORUM [NAME...]   open the Senate tab (default senators if none named)
+senate call FORUM N              open round N for every senator (brief.md must exist)
+senate legion FORUM              open the Legion tab from FORUM/units.json
+senate wait FORUM round-N|legion [TIMEOUT_SECS]
+senate send FORUM NAME TEXT      type one line to a senator or unit's pane
+senate order FORUM UNIT TEXT     clear the unit's report.done and send revised orders
+senate revive FORUM NAME         relaunch a stopped senator or unit in a fresh pane
+senate status FORUM
+senate dismiss FORUM [senate|legion|all]
+EOF
+}
+
+load_forum() {
+  [ -n "${1:-}" ] || die "forum path required"
+  FORUM=$(cd "$1" 2>/dev/null && pwd) || die "no forum at $1"
+  [ -f "$FORUM/state.json" ] || die "$FORUM is not a forum"
+  SESSION=$(jq -r .session "$FORUM/state.json")
+  REPO=$(jq -r .repo "$FORUM/state.json")
+}
+
+state() { jq -r "$@" "$FORUM/state.json"; }
+
+set_state() {
+  jq "$@" "$FORUM/state.json" >"$FORUM/state.json.tmp"
+  mv "$FORUM/state.json.tmp" "$FORUM/state.json"
+}
+
+acta() { printf -- '- %s %s\n' "$(date '+%Y-%m-%d %H:%M')" "$*" >>"$FORUM/acta.md"; }
+
+capitalize() { printf '%s%s' "$(printf '%s' "${1:0:1}" | tr '[:lower:]' '[:upper:]')" "${1:1}"; }
+
+render() {
+  perl -pe 's/\{\{(\w+)\}\}/exists $ENV{"T_$1"} ? $ENV{"T_$1"} : $&/ge' "$@"
+}
+
+block_running() {
+  rex block call -s "$SESSION" -b "$1" process 2>/dev/null | jq -e '.child != null' >/dev/null 2>&1
+}
+
+send_line() {
+  rex send -s "$SESSION" -b "$1" "$2" >/dev/null
+  sleep 0.2
+  rex send-key -s "$SESSION" -b "$1" enter >/dev/null
+}
+
+# write_launcher OUT AGENT MODEL EFFORT CWD PROMPT_FILE DISPLAY_NAME [ARGS...]
+write_launcher() {
+  local out=$1 agent=$2 model=$3 effort=$4 cwd=$5 prompt=$6 display=$7
+  shift 7
+  {
+    echo '#!/usr/bin/env bash'
+    printf 'cd %q || exit 1\n' "$cwd"
+    case $agent in
+      codex)
+        printf 'exec codex'
+        printf ' %q' -C "$cwd" -m "$model" \
+          -c "model_reasoning_effort=\"$effort\"" \
+          -c "projects.\"$cwd\".trust_level=\"trusted\"" \
+          -c "projects.\"$REPO\".trust_level=\"trusted\"" \
+          ${@+"$@"}
+        printf ' "$(cat %q)"\n' "$prompt"
+        ;;
+      claude)
+        printf 'exec claude "$(cat %q)"' "$prompt"
+        printf ' %q' --model "$model" --effort "$effort" -n "$display" ${@+"$@"}
+        echo
+        ;;
+      *) die "unknown agent '$agent' (expected codex or claude)" ;;
+    esac
+  } >"$out"
+  chmod +x "$out"
+}
+
+# Reads a jq array path from the roster, renders {{KEY}} placeholders, and fills ARGS.
+load_args() {
+  ARGS=()
+  local line
+  while IFS= read -r line; do
+    ARGS+=("$(printf '%s' "$line" | render)")
+  done < <(jq -r "$1 // [] | .[]" "$ROSTER")
+}
+
+# Pane queue consumed by place_panes.
+P_LABEL=() P_CWD=() P_SCRIPT=() P_BLOCK=()
+
+# place_panes TAB ADD_DIRECTION EXISTING_WINDOW EXISTING_LAST_BLOCK
+# Builds a fresh tab (one row up to 3 panes, else a 2-row grid), or adds splits to a live one.
+place_panes() {
+  local tab=$1 add_dir=$2 win=$3 last=$4 n=${#P_LABEL[@]} out i
+  P_BLOCK=()
+  [ "$n" -gt 0 ] || return 0
+
+  if [ -n "$win" ] && [ -n "$last" ] && rex block inspect -s "$SESSION" "$last" >/dev/null 2>&1; then
+    WIN=$win
+    for ((i = 0; i < n; i++)); do
+      out=$(rex split -s "$SESSION" -b "$last" --split="$add_dir" --ratio 50 --label "${P_LABEL[$i]}" \
+        -c "${P_CWD[$i]}" --focus=false --keep-open --json -- bash "${P_SCRIPT[$i]}")
+      last=$(jq -r '.block_ids[0]' <<<"$out")
+      P_BLOCK+=("$last")
+    done
+    return 0
+  fi
+
+  local cols=$n
+  [ "$n" -le 3 ] || cols=$(((n + 1) / 2))
+
+  out=$(rex window new -s "$SESSION" "$tab" -c "${P_CWD[0]}" --focus=false --keep-open --json -- bash "${P_SCRIPT[0]}")
+  WIN=$(jq -r '.window_id' <<<"$out")
+  P_BLOCK+=("$(jq -r '.block_ids[0]' <<<"$out")")
+  rex block rename -s "$SESSION" "${P_BLOCK[0]}" "${P_LABEL[0]}" >/dev/null
+
+  for ((i = 1; i < cols; i++)); do
+    out=$(rex split -s "$SESSION" -b "${P_BLOCK[$((i - 1))]}" --split=right \
+      --ratio $((100 * (cols - i) / (cols - i + 1))) --label "${P_LABEL[$i]}" \
+      -c "${P_CWD[$i]}" --focus=false --keep-open --json -- bash "${P_SCRIPT[$i]}")
+    P_BLOCK+=("$(jq -r '.block_ids[0]' <<<"$out")")
+  done
+  for ((i = cols; i < n; i++)); do
+    out=$(rex split -s "$SESSION" -b "${P_BLOCK[$((i - cols))]}" --split=below --ratio 50 \
+      --label "${P_LABEL[$i]}" -c "${P_CWD[$i]}" --focus=false --keep-open --json -- bash "${P_SCRIPT[$i]}")
+    P_BLOCK+=("$(jq -r '.block_ids[0]' <<<"$out")")
+  done
+}
+
+cmd_init() {
+  local slug=${1:?slug required} repo=${2:-$PWD}
+  [ -n "${REX_SESSION:-}" ] || die "REX_SESSION is not set; run inside Rex"
+  repo=$(cd "$repo" && (git rev-parse --show-toplevel 2>/dev/null || pwd))
+  FORUM=$SENATE_HOME/$(date +%Y%m%d-%H%M)-$slug
+  [ ! -e "$FORUM" ] || die "$FORUM already exists"
+  mkdir -p "$FORUM/round-1" "$FORUM/units" "$FORUM/members"
+  jq -n --arg repo "$repo" --arg session "$REX_SESSION" \
+    '{repo: $repo, session: $session, senate: {window: null, members: {}}, legion: {window: null, units: {}}}' \
+    >"$FORUM/state.json"
+  echo "# Acta" >"$FORUM/acta.md"
+  acta "Forum opened for $repo"
+  echo "$FORUM"
+}
+
+cmd_latest() {
+  local latest
+  latest=$(ls -dt "$SENATE_HOME"/*/ 2>/dev/null | head -1)
+  [ -n "$latest" ] || die "no forums in $SENATE_HOME"
+  echo "${latest%/}"
+}
+
+cmd_roster() {
+  jq -r '
+    "Senators (default: \(.default_senate | join(", "))):",
+    (.senators | to_entries[] | "  \(.key)\t\(.value.agent) \(.value.model) \(.value.effort)\t\(.value.lens)"),
+    "Legionaries (default: \(.default_legionary)):",
+    (.legionaries | to_entries[] | "  \(.key)\t\(.value.agent) \(.value.model) \(.value.effort)\t\(.value.use)")
+  ' "$ROSTER"
+}
+
+cmd_convene() {
+  load_forum "${1:-}"
+  shift
+  [ -f "$FORUM/motion.md" ] || die "write $FORUM/motion.md first"
+  [ -f "$FORUM/round-1/brief.md" ] || die "write $FORUM/round-1/brief.md first"
+  [ $# -gt 0 ] || set -- $(jq -r '.default_senate[]' "$ROSTER")
+
+  local names=() name agent model effort
+  P_LABEL=() P_CWD=() P_SCRIPT=()
+  for name in "$@"; do
+    jq -e --arg n "$name" '.senators[$n]' "$ROSTER" >/dev/null ||
+      die "unknown senator '$name'; known: $(jq -r '.senators | keys | join(", ")' "$ROSTER")"
+    if [ -n "$(state --arg n "$name" '.senate.members[$n].block // empty')" ]; then
+      echo "senate: $name already sits; skipping" >&2
+      continue
+    fi
+    agent=$(jq -r --arg n "$name" '.senators[$n].agent' "$ROSTER")
+    model=$(jq -r --arg n "$name" '.senators[$n].model' "$ROSTER")
+    effort=$(jq -r --arg n "$name" '.senators[$n].effort' "$ROSTER")
+    export T_NAME T_SLUG=$name T_FORUM=$FORUM T_REPO=$REPO T_LENS
+    T_NAME=$(capitalize "$name")
+    T_LENS=$(jq -r --arg n "$name" '.senators[$n].lens' "$ROSTER")
+    render "$SKILL_DIR/charters/senator.md" >"$FORUM/members/$name.prompt.md"
+    load_args ".senators[\"$name\"].args"
+    write_launcher "$FORUM/members/$name.sh" "$agent" "$model" "$effort" "$FORUM" \
+      "$FORUM/members/$name.prompt.md" "$T_NAME (senator)" ${ARGS[@]+"${ARGS[@]}"}
+    names+=("$name")
+    P_LABEL+=("$T_NAME · $model $effort")
+    P_CWD+=("$FORUM")
+    P_SCRIPT+=("$FORUM/members/$name.sh")
+  done
+  [ ${#names[@]} -gt 0 ] || return 0
+
+  place_panes Senate right "$(state '.senate.window // empty')" \
+    "$(state '[.senate.members[].block] | last // empty')"
+
+  set_state --arg w "$WIN" '.senate.window = $w'
+  local i
+  for ((i = 0; i < ${#names[@]}; i++)); do
+    set_state --arg n "${names[$i]}" --arg b "${P_BLOCK[$i]}" '.senate.members[$n] = {block: $b}'
+    printf '%s\t%s\n' "${names[$i]}" "${P_BLOCK[$i]}"
+  done
+  acta "Senate convened: ${names[*]}"
+}
+
+cmd_call() {
+  load_forum "${1:-}"
+  local n=${2:?round number required} brief name block
+  brief=$FORUM/round-$n/brief.md
+  [ -f "$brief" ] || die "write $brief first"
+  for name in $(state '.senate.members | keys[]'); do
+    block=$(state --arg n "$name" '.senate.members[$n].block')
+    rm -f "$FORUM/round-$n/$name.done"
+    send_line "$block" "Round $n is open. Read $brief, write $FORUM/round-$n/$name.md, then create $FORUM/round-$n/$name.done."
+  done
+  acta "Round $n opened"
+}
+
+cmd_legion() {
+  load_forum "${1:-}"
+  local units=$FORUM/units.json count i id legionary branch base wt agent model effort
+  [ -f "$units" ] || die "write $units first: [{\"id\", \"branch\", \"legionary\"?, \"base\"?}]"
+  count=$(jq length "$units")
+  local ids=() wts=() branches=() legs=()
+  P_LABEL=() P_CWD=() P_SCRIPT=()
+
+  for ((i = 0; i < count; i++)); do
+    id=$(jq -r ".[$i].id" "$units")
+    branch=$(jq -r ".[$i].branch" "$units")
+    legionary=$(jq -r --arg d "$(jq -r .default_legionary "$ROSTER")" ".[$i].legionary // \$d" "$units")
+    base=$(jq -r ".[$i].base // \"HEAD\"" "$units")
+    if [ -n "$(state --arg u "$id" '.legion.units[$u].block // empty')" ]; then
+      echo "senate: unit $id already marching; skipping" >&2
+      continue
+    fi
+    [ -f "$FORUM/units/$id/orders.md" ] || die "write $FORUM/units/$id/orders.md first"
+    jq -e --arg l "$legionary" '.legionaries[$l]' "$ROSTER" >/dev/null ||
+      die "unknown legionary '$legionary'; known: $(jq -r '.legionaries | keys | join(", ")' "$ROSTER")"
+
+    wt="$(dirname "$REPO")/$(basename "$REPO").${branch//\//-}"
+    if [ ! -d "$wt" ]; then
+      if git -C "$REPO" show-ref --verify --quiet "refs/heads/$branch"; then
+        git -C "$REPO" worktree add "$wt" "$branch" >&2
+      else
+        git -C "$REPO" worktree add -b "$branch" "$wt" "$base" >&2
+      fi
+    fi
+
+    agent=$(jq -r --arg l "$legionary" '.legionaries[$l].agent' "$ROSTER")
+    model=$(jq -r --arg l "$legionary" '.legionaries[$l].model' "$ROSTER")
+    effort=$(jq -r --arg l "$legionary" '.legionaries[$l].effort' "$ROSTER")
+    export T_UNIT=$id T_WORKTREE=$wt T_BRANCH=$branch T_FORUM=$FORUM T_REPO=$REPO
+    render "$SKILL_DIR/charters/legionary.md" >"$FORUM/members/unit-$id.prompt.md"
+    load_args ".legionary_args[\"$agent\"]"
+    write_launcher "$FORUM/members/unit-$id.sh" "$agent" "$model" "$effort" "$wt" \
+      "$FORUM/members/unit-$id.prompt.md" "Legionary $id" ${ARGS[@]+"${ARGS[@]}"}
+
+    ids+=("$id") wts+=("$wt") branches+=("$branch") legs+=("$legionary")
+    P_LABEL+=("$id · $model $effort")
+    P_CWD+=("$wt")
+    P_SCRIPT+=("$FORUM/members/unit-$id.sh")
+  done
+  [ ${#ids[@]} -gt 0 ] || return 0
+
+  place_panes Legion below "$(state '.legion.window // empty')" \
+    "$(state '[.legion.units[].block] | last // empty')"
+
+  set_state --arg w "$WIN" '.legion.window = $w'
+  for ((i = 0; i < ${#ids[@]}; i++)); do
+    set_state --arg u "${ids[$i]}" --arg b "${P_BLOCK[$i]}" --arg l "${legs[$i]}" \
+      --arg wt "${wts[$i]}" --arg br "${branches[$i]}" \
+      '.legion.units[$u] = {block: $b, legionary: $l, worktree: $wt, branch: $br}'
+    printf '%s\t%s\t%s\t%s\n' "${ids[$i]}" "${legs[$i]}" "${wts[$i]}" "${P_BLOCK[$i]}"
+  done
+  acta "Legion marched: ${ids[*]}"
+}
+
+cmd_wait() {
+  load_forum "${1:-}"
+  local target=${2:?round-N or legion required} timeout=${3:-3600} group pattern
+  case $target in
+    round-*) group=senate.members pattern="$FORUM/$target/%s.done" ;;
+    legion) group=legion.units pattern="$FORUM/units/%s/report.done" ;;
+    *) die "wait target must be round-N or legion" ;;
+  esac
+
+  local names start tick=0 last="" name done_list waiting line block
+  names=$(state ".$group | keys[]")
+  [ -n "$names" ] || die "nobody to wait for in $group"
+  start=$(date +%s)
+  while :; do
+    done_list="" waiting=""
+    for name in $names; do
+      # shellcheck disable=SC2059
+      if [ -f "$(printf "$pattern" "$name")" ]; then done_list+=" $name"; else waiting+=" $name"; fi
+    done
+    line="done:${done_list:- none} | waiting:${waiting:- none}"
+    [ "$line" = "$last" ] || echo "$(date +%H:%M:%S) $line"
+    last=$line
+    [ -n "$waiting" ] || return 0
+
+    if [ $((tick % 10)) -eq 0 ]; then
+      for name in $waiting; do
+        block=$(state --arg n "$name" ".$group[\$n].block")
+        block_running "$block" || die "$name's pane ($block) is no longer running; check it with: rex capture -s $SESSION -b $block --trim"
+      done
+    fi
+    [ $(($(date +%s) - start)) -lt "$timeout" ] || {
+      echo "timed out after ${timeout}s; still waiting on:$waiting"
+      return 2
+    }
+    tick=$((tick + 1))
+    sleep 3
+  done
+}
+
+find_block() {
+  state --arg n "$1" '.senate.members[$n].block // .legion.units[$n].block // empty'
+}
+
+cmd_send() {
+  load_forum "${1:-}"
+  local name=${2:?name required} block
+  shift 2
+  block=$(find_block "$name")
+  [ -n "$block" ] || die "no senator or unit named $name"
+  send_line "$block" "$*"
+}
+
+cmd_order() {
+  load_forum "${1:-}"
+  local unit=${2:?unit required} block
+  shift 2
+  block=$(state --arg u "$unit" '.legion.units[$u].block // empty')
+  [ -n "$block" ] || die "no unit named $unit"
+  rm -f "$FORUM/units/$unit/report.done"
+  send_line "$block" "Orders revised: $* When done, update report.md and create report.done again."
+  acta "Orders revised for $unit"
+}
+
+cmd_revive() {
+  load_forum "${1:-}"
+  local name=${2:?name required} block
+  block=$(find_block "$name")
+  [ -n "$block" ] || die "no senator or unit named $name"
+  rex block close -s "$SESSION" "$block" >/dev/null 2>&1 || true
+  if [ -n "$(state --arg n "$name" '.senate.members[$n] // empty')" ]; then
+    set_state --arg n "$name" 'del(.senate.members[$n])'
+    acta "Reviving senator $name"
+    cmd_convene "$FORUM" "$name"
+  else
+    set_state --arg n "$name" 'del(.legion.units[$n])'
+    acta "Reviving unit $name"
+    cmd_legion "$FORUM"
+  fi
+}
+
+cmd_status() {
+  load_forum "${1:-}"
+  local name block run latest wt
+  echo "Forum: $FORUM"
+  echo "Repo:  $REPO"
+  latest=$FORUM/round-$(ls "$FORUM" | sed -n 's/^round-\([0-9]*\)$/\1/p' | sort -n | tail -1)
+  echo "Senate (latest ${latest##*/}):"
+  for name in $(state '.senate.members | keys[]'); do
+    block=$(state --arg n "$name" '.senate.members[$n].block')
+    block_running "$block" && run=running || run=stopped
+    [ -f "$latest/$name.done" ] && st=done || st=pending
+    printf '  %-10s %-8s %-8s %s\n' "$name" "$run" "$st" "$block"
+  done
+  echo "Legion:"
+  for name in $(state '.legion.units | keys[]'); do
+    block=$(state --arg n "$name" '.legion.units[$n].block')
+    wt=$(state --arg n "$name" '.legion.units[$n].worktree')
+    block_running "$block" && run=running || run=stopped
+    [ -f "$FORUM/units/$name/report.done" ] && st=reported || st=working
+    printf '  %-14s %-8s %-9s %3s files changed  %s\n' "$name" "$run" "$st" \
+      "$(git -C "$wt" status --porcelain 2>/dev/null | wc -l | tr -d ' ')" "$wt"
+  done
+}
+
+cmd_dismiss() {
+  load_forum "${1:-}"
+  local what=${2:-all} part win
+  for part in senate legion; do
+    [ "$what" = all ] || [ "$what" = "$part" ] || continue
+    win=$(state ".$part.window // empty")
+    [ -z "$win" ] || rex window close -s "$SESSION" "$win" >/dev/null 2>&1 || true
+    if [ "$part" = senate ]; then
+      set_state '.senate = {window: null, members: {}}'
+    else
+      set_state '.legion = {window: null, units: {}}'
+    fi
+  done
+  acta "Dismissed: $what"
+}
+
+cmd=${1:-help}
+[ $# -eq 0 ] || shift
+case $cmd in
+  init | latest | roster | convene | call | legion | wait | send | order | revive | status | dismiss) "cmd_$cmd" "$@" ;;
+  help | -h | --help) usage ;;
+  *) usage >&2; exit 1 ;;
+esac
