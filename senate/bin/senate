@@ -18,7 +18,7 @@ usage() {
 senate init SLUG [REPO]          create a forum, print its path
 senate latest                    print the most recent forum
 senate roster                    list senators and legionaries
-senate convene FORUM [NAME...]   open the Senate tab (default senators if none named)
+senate convene FORUM [SEAT...]   open the Senate tab; SEAT is NAME[:MODEL[:EFFORT]] (default senators if none)
 senate call FORUM N              open round N for every senator (brief.md must exist)
 senate legion FORUM              open the Legion tab from FORUM/units.json
 senate wait FORUM round-N|legion [TIMEOUT_SECS]
@@ -36,6 +36,23 @@ load_forum() {
   [ -f "$FORUM/state.json" ] || die "$FORUM is not a forum"
   SESSION=$(jq -r .session "$FORUM/state.json")
   REPO=$(jq -r .repo "$FORUM/state.json")
+  [ -n "${SENATE_ROSTER:-}" ] || ROSTER=$(jq -r --arg d "$ROSTER" '.roster // $d' "$FORUM/state.json")
+  [ -f "$ROSTER" ] || die "roster not found: $ROSTER"
+}
+
+trust_senate_home() {
+  local cfg=${CLAUDE_CONFIG_DIR:-$HOME}/.claude.json home tmp
+  [ -f "$cfg" ] || return 0
+  home=$(cd "$SENATE_HOME" && pwd -P)
+  jq -e --arg d "$home" '.projects[$d].hasTrustDialogAccepted == true' "$cfg" >/dev/null 2>&1 && return 0
+  tmp=$(mktemp)
+  jq --arg d "$home" '.projects[$d] = ((.projects[$d] // {}) + {hasTrustDialogAccepted: true})' "$cfg" >"$tmp" &&
+    cat "$tmp" >"$cfg"
+  rm -f "$tmp"
+}
+
+agent_for_model() {
+  case $1 in opus* | sonnet* | haiku* | fable* | claude-*) echo claude ;; *) echo codex ;; esac
 }
 
 state() { jq -r "$@" "$FORUM/state.json"; }
@@ -149,8 +166,10 @@ cmd_init() {
   FORUM=$SENATE_HOME/$(date +%Y%m%d-%H%M)-$slug
   [ ! -e "$FORUM" ] || die "$FORUM already exists"
   mkdir -p "$FORUM/round-1" "$FORUM/units" "$FORUM/members"
-  jq -n --arg repo "$repo" --arg session "$REX_SESSION" \
-    '{repo: $repo, session: $session, senate: {window: null, members: {}}, legion: {window: null, units: {}}}' \
+  local roster
+  roster=$(cd "$(dirname "$ROSTER")" && pwd)/$(basename "$ROSTER")
+  jq -n --arg repo "$repo" --arg session "$REX_SESSION" --arg roster "$roster" \
+    '{repo: $repo, session: $session, roster: $roster, senate: {window: null, members: {}}, legion: {window: null, units: {}}}' \
     >"$FORUM/state.json"
   echo "# Acta" >"$FORUM/acta.md"
   acta "Forum opened for $repo"
@@ -179,10 +198,12 @@ cmd_convene() {
   [ -f "$FORUM/motion.md" ] || die "write $FORUM/motion.md first"
   [ -f "$FORUM/round-1/brief.md" ] || die "write $FORUM/round-1/brief.md first"
   [ $# -gt 0 ] || set -- $(jq -r '.default_senate[]' "$ROSTER")
+  trust_senate_home
 
-  local names=() name agent model effort
+  local names=() seats=() seat name model_o effort_o agent model effort args_path
   P_LABEL=() P_CWD=() P_SCRIPT=()
-  for name in "$@"; do
+  for seat in "$@"; do
+    IFS=: read -r name model_o effort_o <<<"$seat"
     jq -e --arg n "$name" '.senators[$n]' "$ROSTER" >/dev/null ||
       die "unknown senator '$name'; known: $(jq -r '.senators | keys | join(", ")' "$ROSTER")"
     if [ -n "$(state --arg n "$name" '.senate.members[$n].block // empty')" ]; then
@@ -190,16 +211,25 @@ cmd_convene() {
       continue
     fi
     agent=$(jq -r --arg n "$name" '.senators[$n].agent' "$ROSTER")
-    model=$(jq -r --arg n "$name" '.senators[$n].model' "$ROSTER")
-    effort=$(jq -r --arg n "$name" '.senators[$n].effort' "$ROSTER")
+    args_path=".senators[\"$name\"].args // .senator_args[\"$agent\"]"
+    if [ -n "$model_o" ]; then
+      model=$model_o
+      [ "$(agent_for_model "$model")" = "$agent" ] || {
+        agent=$(agent_for_model "$model")
+        args_path=".senator_args[\"$agent\"]"
+      }
+    else
+      model=$(jq -r --arg n "$name" '.senators[$n].model' "$ROSTER")
+    fi
+    effort=${effort_o:-$(jq -r --arg n "$name" '.senators[$n].effort' "$ROSTER")}
     export T_NAME T_SLUG=$name T_FORUM=$FORUM T_REPO=$REPO T_LENS
     T_NAME=$(capitalize "$name")
     T_LENS=$(jq -r --arg n "$name" '.senators[$n].lens' "$ROSTER")
     render "$SKILL_DIR/charters/senator.md" >"$FORUM/members/$name.prompt.md"
-    load_args ".senators[\"$name\"].args"
+    load_args "$args_path"
     write_launcher "$FORUM/members/$name.sh" "$agent" "$model" "$effort" "$FORUM" \
       "$FORUM/members/$name.prompt.md" "$T_NAME (senator)" ${ARGS[@]+"${ARGS[@]}"}
-    names+=("$name")
+    names+=("$name") seats+=("$seat")
     P_LABEL+=("$T_NAME · $model $effort")
     P_CWD+=("$FORUM")
     P_SCRIPT+=("$FORUM/members/$name.sh")
@@ -212,7 +242,8 @@ cmd_convene() {
   set_state --arg w "$WIN" '.senate.window = $w'
   local i
   for ((i = 0; i < ${#names[@]}; i++)); do
-    set_state --arg n "${names[$i]}" --arg b "${P_BLOCK[$i]}" '.senate.members[$n] = {block: $b}'
+    set_state --arg n "${names[$i]}" --arg b "${P_BLOCK[$i]}" --arg s "${seats[$i]}" \
+      '.senate.members[$n] = {block: $b, seat: $s}'
     printf '%s\t%s\n' "${names[$i]}" "${P_BLOCK[$i]}"
   done
   acta "Senate convened: ${names[*]}"
@@ -236,6 +267,7 @@ cmd_legion() {
   local units=$FORUM/units.json count i id legionary branch base wt agent model effort
   [ -f "$units" ] || die "write $units first: [{\"id\", \"branch\", \"legionary\"?, \"base\"?}]"
   count=$(jq length "$units")
+  trust_senate_home
   local ids=() wts=() branches=() legs=()
   P_LABEL=() P_CWD=() P_SCRIPT=()
 
@@ -252,8 +284,9 @@ cmd_legion() {
     jq -e --arg l "$legionary" '.legionaries[$l]' "$ROSTER" >/dev/null ||
       die "unknown legionary '$legionary'; known: $(jq -r '.legionaries | keys | join(", ")' "$ROSTER")"
 
-    wt="$(dirname "$REPO")/$(basename "$REPO").${branch//\//-}"
+    wt="$SENATE_HOME/.worktrees/$(basename "$FORUM")/$(basename "$REPO").${branch//\//-}"
     if [ ! -d "$wt" ]; then
+      mkdir -p "$(dirname "$wt")"
       if git -C "$REPO" show-ref --verify --quiet "refs/heads/$branch"; then
         git -C "$REPO" worktree add "$wt" "$branch" >&2
       else
@@ -261,9 +294,15 @@ cmd_legion() {
       fi
     fi
 
-    agent=$(jq -r --arg l "$legionary" '.legionaries[$l].agent' "$ROSTER")
-    model=$(jq -r --arg l "$legionary" '.legionaries[$l].model' "$ROSTER")
-    effort=$(jq -r --arg l "$legionary" '.legionaries[$l].effort' "$ROSTER")
+    model=$(jq -r ".[$i].model // empty" "$units")
+    if [ -n "$model" ]; then
+      agent=$(agent_for_model "$model")
+    else
+      agent=$(jq -r --arg l "$legionary" '.legionaries[$l].agent' "$ROSTER")
+      model=$(jq -r --arg l "$legionary" '.legionaries[$l].model' "$ROSTER")
+    fi
+    effort=$(jq -r ".[$i].effort // empty" "$units")
+    [ -n "$effort" ] || effort=$(jq -r --arg l "$legionary" '.legionaries[$l].effort' "$ROSTER")
     export T_UNIT=$id T_WORKTREE=$wt T_BRANCH=$branch T_FORUM=$FORUM T_REPO=$REPO
     render "$SKILL_DIR/charters/legionary.md" >"$FORUM/members/unit-$id.prompt.md"
     load_args ".legionary_args[\"$agent\"]"
@@ -355,14 +394,15 @@ cmd_order() {
 
 cmd_revive() {
   load_forum "${1:-}"
-  local name=${2:?name required} block
+  local name=${2:?name required} block seat
   block=$(find_block "$name")
   [ -n "$block" ] || die "no senator or unit named $name"
+  seat=$(state --arg n "$name" '.senate.members[$n].seat // $n')
   rex block close -s "$SESSION" "$block" >/dev/null 2>&1 || true
   if [ -n "$(state --arg n "$name" '.senate.members[$n] // empty')" ]; then
     set_state --arg n "$name" 'del(.senate.members[$n])'
     acta "Reviving senator $name"
-    cmd_convene "$FORUM" "$name"
+    cmd_convene "$FORUM" "$seat"
   else
     set_state --arg n "$name" 'del(.legion.units[$n])'
     acta "Reviving unit $name"

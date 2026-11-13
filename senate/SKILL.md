@@ -21,13 +21,13 @@ Use the Senate for ambiguous, risky, or multi-part work. For a one-file fix, tel
 
 ## The `senate` script
 
-`senate` is `bin/senate` next to this file (symlinked onto `PATH` if installed). It builds Rex tabs, launches agents, and moves messages; you do the thinking. Run `senate help` for usage. All commands take the forum path; keep it in a variable. Requires Rex (`REX_SESSION` set), `jq`, `codex`, and `claude`.
+`senate` is `bin/senate` next to this file (symlinked onto `PATH` if installed). It builds Rex tabs, launches agents, and moves messages; you do the thinking. Run `senate help` for usage. All commands take the forum path; keep it in a variable. `SENATE_ROSTER` points at a different roster file; `senate init` records it in the forum, so later commands use it without the variable. Requires Rex (`REX_SESSION` set), `jq`, `codex`, and `claude`.
 
 Panes are interactive agents. The Tribune can watch and type to any of them. Members signal completion by creating `.done` files; `senate wait` blocks until they all exist and fails early if a member's pane stops. Run long waits in the background if your harness supports it, otherwise in the foreground.
 
 ## 1. Motion
 
-Invocation: `/senate [with <senators or models>] <task>`. Map model names to senators via `senate roster` (e.g. "sol" → cato, "opus" → cicero); with none named, the roster default sits. Ask the Tribune only if a name is ambiguous.
+Invocation: `/senate [with <senators or models>] <task>`. Map model names to senators via `senate roster` (e.g. "sol" → cato, "opus" → cicero); with none named, the roster default sits. When the Tribune names a model to use instead of the roster's ("just haiku", "all on sonnet"), seat the default senators with that model, e.g. `senate convene "$F" cato:haiku cicero:haiku`, and set `"model"` on every unit in `units.json`. A seat is `name[:model[:effort]]`; the senator keeps its lens, and the agent (claude or codex) follows from the model. Ask the Tribune only if a name is ambiguous.
 
 1. Investigate just enough to frame the problem: ticket, relevant code, repo rules.
 2. `F=$(senate init <slug> <repo>)`
@@ -38,7 +38,7 @@ Invocation: `/senate [with <senators or models>] <task>`. Map model names to sen
    - **Out of scope**.
    - **Questions** you want the Senate to settle.
 4. Write `$F/round-1/brief.md`: "Propose an approach independently. Do not read other senators' round-1 files." Name any specific angles you want covered.
-5. `senate convene "$F" [names...]`. Round 1 starts automatically. Tell the Tribune the Senate tab is open.
+5. `senate convene "$F" [seats...]`. Round 1 starts automatically. Tell the Tribune the Senate tab is open.
 
 ## 2. Debate
 
@@ -97,8 +97,8 @@ For each unit of the current wave:
    - non-goals
    - which tests to run, or to leave for the augurs
    - any context from the debate the worker needs
-2. Write `$F/units.json`, e.g. `[{"id":"api","branch":"ig/van-123-api","legionary":"terra","base":"origin/master"}]`. `legionary` and `base` are optional. Name branches following the repo's rules, such as including a ticket ID.
-3. `senate legion "$F"`. This creates the worktrees, next to the repo as `<repo>.<branch>`, and opens the Legion tab.
+2. Write `$F/units.json`, e.g. `[{"id":"api","branch":"ig/van-123-api","legionary":"terra","base":"origin/master"}]`. `legionary`, `base`, `model`, and `effort` are optional; `model` and `effort` override the legionary's. Name branches following the repo's rules, such as including a ticket ID.
+3. `senate legion "$F"`. This creates the worktrees at `~/.senate/.worktrees/<forum>/<repo>.<branch>` and opens the Legion tab.
 4. `senate wait "$F" legion`.
 
 Senators sit idle while the Legion marches. Leave them open; you will need them for review.
@@ -145,4 +145,4 @@ Append to `$F/acta.md` at each phase change and decision; the script also logs t
 
 - **Pane stopped**: read why with `rex capture -s <session> -b <block> --trim`, then run `senate revive "$F" <name>` to relaunch it in a fresh pane. It picks up from the forum, but its earlier conversation is lost.
 - **A member never creates `.done`**: `senate send "$F" <name> "Please finish and create <path>.done."`. If the pane is waiting on an approval prompt, tell the Tribune; that is their call to make.
-- **First run**: Claude Code asks you to trust a new directory. Trusting `~/.senate` once covers every forum.
+- **Folder trust**: `convene` and `legion` mark `~/.senate` as trusted in Claude Code's config, which covers every forum and worktree under it. If a pane still shows the trust prompt, its default answer exits; tell the Tribune before anyone presses Enter.

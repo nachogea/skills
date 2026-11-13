@@ -4,28 +4,29 @@
       "lens": "The skeptic. Hunt for what breaks: failure modes, data loss, races, migrations, tenant isolation, rollout and rollback risk. Ask for evidence before accepting a claim.",
       "agent": "codex",
       "model": "gpt-6.1-sol",
-      "effort": "xhigh",
-      "args": ["-s", "workspace-write", "-a", "on-request"]
+      "effort": "xhigh"
     },
     "cicero": {
       "lens": "The architect. Argue for the design that fits the codebase's existing patterns best and whose interfaces will age well. Make the strongest case for an approach, then defend or concede it on the merits.",
       "agent": "claude",
       "model": "opus",
-      "effort": "high",
-      "args": [
-        "--add-dir", "{{REPO}}",
-        "--allowedTools", "Read,Grep,Glob,Edit(/{{FORUM}}/**),Write(/{{FORUM}}/**),Bash(git log:*),Bash(git show:*),Bash(git diff:*),Bash(git grep:*)"
-      ]
+      "effort": "high"
     },
     "seneca": {
       "lens": "The minimalist. Find the smallest change that fully solves the problem. Cut scope, abstractions, and units of work that are not needed.",
       "agent": "codex",
       "model": "gpt-6.1-terra",
-      "effort": "high",
-      "args": ["-s", "workspace-write", "-a", "on-request"]
+      "effort": "high"
     }
   },
   "default_senate": ["cato", "cicero"],
+  "senator_args": {
+    "codex": ["-s", "workspace-write", "-a", "on-request"],
+    "claude": [
+      "--add-dir", "{{REPO}}",
+      "--allowedTools", "Read,Grep,Glob,Edit(/{{FORUM}}/**),Write(/{{FORUM}}/**),Bash(git log:*),Bash(git show:*),Bash(git diff:*),Bash(git grep:*)"
+    ]
+  },
 
   "legionaries": {
     "terra": {
